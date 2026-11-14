@@ -1,0 +1,128 @@
+name: Wdrożenie strony www v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      IP_HOSTA:
+        description: 'Podaj adres IP hosta na który zrealizować wdrożenie strony www'
+        required: true
+        default: '0.0.0.0'
+      SSH_USER:
+        description: 'Użytkownik SSH do połączenia z hostem (domyślnie: kursant)'
+        required: false
+        default: 'kursant'
+
+concurrency:
+  group: deploy-www-${{ github.event.inputs.IP_HOSTA }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Ansible Lint
+    runs-on: moj_ansible
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+
+      - name: Sprawdzenie czy zainstalowane ansible-lint
+        id: check_lint
+        run: |
+          if command -v ansible-lint >/dev/null 2>&1; then
+            echo "ansible-lint już jest zainstalowany."
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ansible-lint nie jest zainstalowany."
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Instalacja ansible-lint
+        if: steps.check_lint.outputs.installed == 'false'
+        run: |
+          echo "Instalowanie ansible-lint..."
+          sudo apt update
+          sudo apt install -y ansible-lint
+
+      - name: Uruchomienie ansible-lint
+        run: |
+          echo "Linting playbooków..."
+          ansible-lint instalacja_dockernginx_strona.yaml
+
+  deploy:
+    needs: lint
+    runs-on: moj_ansible
+    timeout-minutes: 30
+    environment: production
+    env:
+      IP_HOSTA: ${{ github.event.inputs.IP_HOSTA }}
+      SSH_USER: ${{ github.event.inputs.SSH_USER }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+
+      - name: Walidacja adresu IP
+        run: |
+          echo "Sprawdzam IP_HOSTA=${IP_HOSTA}"
+          if [ -z "${IP_HOSTA}" ]; then
+            echo "BŁĄD: IP_HOSTA jest puste."
+            exit 1
+          fi
+          if [ "${IP_HOSTA}" = "0.0.0.0" ]; then
+            echo "BŁĄD: IP_HOSTA nie może być 0.0.0.0."
+            exit 1
+          fi
+          IP_REGEX='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+          if ! [[ "${IP_HOSTA}" =~ ${IP_REGEX} ]]; then
+            echo "BŁĄD: IP_HOSTA nie jest poprawnym adresem IPv4 (zły format)."
+            exit 1
+          fi
+          IFS='.' read -r o1 o2 o3 o4 <<< "${IP_HOSTA}"
+          for o in "$o1" "$o2" "$o3" "$o4"; do
+            if [ "$o" -lt 0 ] || [ "$o" -gt 255 ]; then
+              echo "BŁĄD: IP_HOSTA zawiera oktet spoza zakresu 0–255: ${o}"
+              exit 1
+            fi
+          done
+          echo "Adres IP_HOSTA jest poprawny."
+
+      - name: Sprawdzenie, czy Ansible jest dostępny na runnerze
+        run: |
+          if ! command -v ansible >/dev/null 2>&1; then
+            echo "BŁĄD: Ansible nie jest zainstalowany na runnerze."
+            exit 1
+          fi
+          if ! command -v ansible-playbook >/dev/null 2>&1; then
+            echo "BŁĄD: ansible-playbook nie jest dostępny."
+            exit 1
+          fi
+          echo "Ansible jest dostępny:"
+          ansible --version
+
+      - name: Budowa pliku inwentarza dla Ansible
+        run: |
+          echo "Ustawienie pliku inventory"
+          mkdir -p ./inventory
+          cat << EOF > ./inventory/serwery.yaml
+          all:
+            children:
+              servers:
+                children:
+                  serweryweb:
+                    hosts:
+                      docker.grzegorzek.lan:
+                        ansible_host: ${IP_HOSTA}
+                        ansible_connection: ssh
+                        ansible_ssh_user: ${SSH_USER}
+                        ansible_python_interpreter: /usr/bin/python3
+          EOF
+          echo "Plik inventory/serwery.yaml:"
+          cat ./inventory/serwery.yaml
+
+      - name: Ansible ping test do hosta
+        run: |
+          echo "Sprawdzam, czy host jest osiągalny przez Ansible (moduł ping)..."
+          ansible all -i ./inventory/serwery.yaml -m ping
+
+      - name: Uruchomienie scenariusza Ansible
+        run: |
+          echo "Start ansible-playbook..."
+          ansible-playbook -i ./inventory/serwery.yaml instalacja_dockernginx_strona.yaml
